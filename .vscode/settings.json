@@ -1,0 +1,9 @@
+{
+    "cmake.useCMakePresets": "always",
+    "cmake.defaultConfigurePreset": "Debug",
+    "cmake.defaultBuildPreset": "Debug",
+    "cmake.configureOnOpen": false,
+    "cmake.preferredGenerators": [
+        "Ninja"
+    ]
+}

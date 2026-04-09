@@ -1,0 +1,69 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "STM32: Configure Debug",
+            "type": "shell",
+            "command": "cmake",
+            "args": [
+                "--preset",
+                "Debug",
+                "--fresh"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "STM32: Build Debug",
+            "type": "shell",
+            "command": "cmake",
+            "args": [
+                "--build",
+                "build/Debug"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "dependsOn": [
+                "STM32: Configure Debug"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": [
+                "$gcc"
+            ]
+        },
+        {
+            "label": "STM32: Flash Debug Hex",
+            "type": "shell",
+            "command": "D:/ST/STM32CubeCLT_1.21.0/STM32CubeProgrammer/bin/STM32_Programmer_CLI.exe",
+            "args": [
+                "-c",
+                "port=SWD",
+                "mode=UR",
+                "reset=HWrst",
+                "-w",
+                "${workspaceFolder}/build/Debug/STM32_ESC_DSHOT_H1.hex",
+                "-v",
+                "-rst"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "STM32: Build + Flash",
+            "dependsOrder": "sequence",
+            "dependsOn": [
+                "STM32: Build Debug",
+                "STM32: Flash Debug Hex"
+            ],
+            "problemMatcher": []
+        }
+    ]
+}

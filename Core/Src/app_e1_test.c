@@ -326,55 +326,17 @@ void process_adc_average(E1_AdcProcessed_t *out)
 
 void update_zero_offset(const E1_AdcProcessed_t *adc_data, uint32_t now_ms)
 {
-    uint32_t state_elapsed_ms;
+    (void)adc_data;
+    (void)now_ms;
 
-    if (adc_data == NULL)
-    {
-        return;
-    }
-
-    if (g_h1.current_dshot_value != 0U)
-    {
-        return;
-    }
-
-    if ((now_ms - g_h1.last_zero_offset_sample_tick) < E1_ZERO_OFFSET_SAMPLE_INTERVAL_MS)
-    {
-        return;
-    }
-
-    g_h1.last_zero_offset_sample_tick = now_ms;
-
-    if ((g_h1.state == STATE_WAIT_BT) || (g_h1.state == STATE_PREPARE))
-    {
-        g_h1.zero_offset_sum_v += adc_data->v_i_sense;
-        g_h1.zero_offset_sample_count++;
-
-        if (g_h1.zero_offset_sample_count > 0U)
-        {
-            g_h1.baseline_zero_offset_voltage = g_h1.zero_offset_sum_v / (float)g_h1.zero_offset_sample_count;
-            g_h1.active_zero_offset_voltage = g_h1.baseline_zero_offset_voltage;
-        }
-        return;
-    }
-
-    state_elapsed_ms = now_ms - g_h1.state_enter_tick;
-
-    if (g_h1.state == STATE_STOP)
-    {
-        if (state_elapsed_ms >= E1_ZERO_TRACK_DELAY_MS)
-        {
-            g_h1.active_zero_offset_voltage +=
-                E1_ZERO_TRACK_ALPHA_STOP * (adc_data->v_i_sense - g_h1.active_zero_offset_voltage);
-        }
-        return;
-    }
-
-    if (g_h1.state == STATE_DONE)
-    {
-        g_h1.active_zero_offset_voltage +=
-            E1_ZERO_TRACK_ALPHA_DONE * (adc_data->v_i_sense - g_h1.active_zero_offset_voltage);
-    }
+    /* Experimental branch: bypass zero-offset tracking and keep the current
+     * chain referenced directly to 0 V so we can compare against the mainline
+     * baseline/active-offset implementation.
+     */
+    g_h1.zero_offset_sum_v = 0.0f;
+    g_h1.zero_offset_sample_count = 0U;
+    g_h1.baseline_zero_offset_voltage = CURRENT_OFFSET_V;
+    g_h1.active_zero_offset_voltage = CURRENT_OFFSET_V;
 }
 
 static void E1_UpdateCurrentDerived(E1_AdcProcessed_t *adc_data)
@@ -386,8 +348,8 @@ static void E1_UpdateCurrentDerived(E1_AdcProcessed_t *adc_data)
         return;
     }
 
-    adc_data->active_zero_offset_V = g_h1.active_zero_offset_voltage;
-    adc_data->delta_i_V = adc_data->v_i_sense - g_h1.active_zero_offset_voltage;
+    adc_data->active_zero_offset_V = CURRENT_OFFSET_V;
+    adc_data->delta_i_V = adc_data->v_i_sense;
 
 #if (E1_CURRENT_SIGN_INVERT != 0U)
     signed_delta_v = -adc_data->delta_i_V;
@@ -521,7 +483,7 @@ static uint8_t E1_IsBluetoothConnected(void)
 static void E1_SendBootBannerOnce(void)
 {
     static const char banner[] =
-        "# boot,t_ms=0,fw=E1_DSHOT300_HC05_TRIGGER,uart=9600,protocol=firewater\r\n";
+        "# boot,t_ms=0,fw=E1_DSHOT300_DIRECT_VSENSE,uart=9600,protocol=firewater\r\n";
 
     if (g_h1.boot_banner_sent == 0U)
     {

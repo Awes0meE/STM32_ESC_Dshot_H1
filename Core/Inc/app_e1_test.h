@@ -60,6 +60,14 @@ extern "C" {
 #define E1_RUN_THROTTLE_STEP_DSHOT     100U
 #endif
 
+#ifndef E1_SWEEP_START_DSHOT
+#define E1_SWEEP_START_DSHOT           600U
+#endif
+
+#ifndef E1_SWEEP_RAMP_RATE_DSHOT_PER_S
+#define E1_SWEEP_RAMP_RATE_DSHOT_PER_S 100U
+#endif
+
 #ifndef E1_RUN_MS
 #define E1_RUN_MS                      60000U
 #endif

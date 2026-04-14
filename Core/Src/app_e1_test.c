@@ -99,6 +99,7 @@ static void E1_UpdateCurrentDerived(E1_AdcProcessed_t *adc_data, uint32_t now_ms
 static void E1_Button_Task(uint32_t now_ms);
 static void E1_HandleThrottleButtonPress(void);
 static void E1_SendThrottleSetLine(void);
+static uint16_t E1_GetRunSweepCommand(uint32_t now_ms);
 static HAL_StatusTypeDef E1_Oled_WriteCommand(uint8_t command);
 static HAL_StatusTypeDef E1_Oled_WriteData(const uint8_t *data, uint16_t size);
 static void E1_Oled_Init(void);
@@ -172,6 +173,12 @@ void E1_Test_Task(void)
     E1_Dshot_Service(now_ms);
     E1_StatusLed_Update(now_ms);
     E1_Button_Task(now_ms);
+
+    if (g_h1.state == STATE_RUN)
+    {
+        set_throttle_command(E1_GetRunSweepCommand(now_ms));
+    }
+
     E1_Oled_Service(now_ms);
     E1_Oled_Update(now_ms);
 
@@ -503,7 +510,7 @@ static void E1_Test_EnterState(E1_TestState_t new_state)
 
     case STATE_RUN:
         E1_ResetCurrentFilter();
-        set_throttle_command(g_h1.run_cmd_dshot);
+        set_throttle_command(E1_GetRunSweepCommand(g_h1.state_enter_tick));
         break;
 
     default:
@@ -549,7 +556,7 @@ static uint8_t E1_IsBluetoothConnected(void)
 static void E1_SendBootBannerOnce(void)
 {
     static const char banner[] =
-        "# boot,t_ms=0,fw=E1_DSHOT300_BASELINE_AVG,uart=9600,protocol=firewater\r\n";
+        "# boot,t_ms=0,fw=E1_DSHOT300_RAMP_SWEEP,uart=9600,protocol=firewater\r\n";
 
     if (g_h1.boot_banner_sent == 0U)
     {
@@ -560,7 +567,7 @@ static void E1_SendBootBannerOnce(void)
 
 static void E1_SendConnectedBannerOnce(void)
 {
-    char line[128];
+    char line[192];
     int len;
 
     if (g_h1.connected_banner_sent != 0U)
@@ -570,11 +577,13 @@ static void E1_SendConnectedBannerOnce(void)
 
     len = snprintf(line,
                    sizeof(line),
-                   "# connected,t_ms=0,state=%s,prepare_ms=%lu,confirm_ms=%lu,run_cmd_raw=%u,dshot_start=after_prepare\r\n",
+                   "# connected,t_ms=0,state=%s,prepare_ms=%lu,confirm_ms=%lu,run_cmd_raw=%u,sweep_start=%u,ramp_per_s=%u,dshot_start=after_prepare\r\n",
                    E1_Test_GetStateName(g_h1.state),
                    (unsigned long)E1_BT_PREPARE_MS,
                    (unsigned long)E1_BT_CONNECT_CONFIRM_MS,
-                   (unsigned int)E1_RUN_THROTTLE_DSHOT);
+                   (unsigned int)E1_RUN_THROTTLE_DSHOT,
+                   (unsigned int)E1_SWEEP_START_DSHOT,
+                   (unsigned int)E1_SWEEP_RAMP_RATE_DSHOT_PER_S);
     if (len > 0)
     {
         E1_UartWrite(line);
@@ -745,6 +754,37 @@ static void E1_SendThrottleSetLine(void)
     {
         E1_UartWrite(line);
     }
+}
+
+static uint16_t E1_GetRunSweepCommand(uint32_t now_ms)
+{
+    uint16_t target_dshot;
+    uint32_t elapsed_ms;
+    uint32_t ramp_add;
+    uint32_t commanded;
+
+    target_dshot = E1_ClampDshotThrottle(g_h1.run_cmd_dshot);
+
+    if (target_dshot <= E1_SWEEP_START_DSHOT)
+    {
+        return target_dshot;
+    }
+
+    if ((g_h1.state != STATE_RUN) || (now_ms <= g_h1.state_enter_tick))
+    {
+        return E1_SWEEP_START_DSHOT;
+    }
+
+    elapsed_ms = now_ms - g_h1.state_enter_tick;
+    ramp_add = (elapsed_ms * (uint32_t)E1_SWEEP_RAMP_RATE_DSHOT_PER_S) / 1000U;
+    commanded = (uint32_t)E1_SWEEP_START_DSHOT + ramp_add;
+
+    if (commanded > target_dshot)
+    {
+        commanded = target_dshot;
+    }
+
+    return (uint16_t)commanded;
 }
 
 static HAL_StatusTypeDef E1_Oled_WriteCommand(uint8_t command)
@@ -933,7 +973,14 @@ static void E1_Oled_Update(uint32_t now_ms)
     }
 
     run_elapsed_s = run_elapsed_ms / 1000U;
-    (void)snprintf(line3, sizeof(line3), "THR  %u", (unsigned int)g_h1.run_cmd_dshot);
+    if (g_h1.state == STATE_RUN)
+    {
+        (void)snprintf(line3, sizeof(line3), "THR  %u", (unsigned int)g_h1.current_dshot_value);
+    }
+    else
+    {
+        (void)snprintf(line3, sizeof(line3), "THR  %u", (unsigned int)g_h1.run_cmd_dshot);
+    }
     if (g_h1.state == STATE_PREPARE)
     {
         (void)snprintf(line4, sizeof(line4), "PREP %2luS", (unsigned long)prepare_remaining_s);

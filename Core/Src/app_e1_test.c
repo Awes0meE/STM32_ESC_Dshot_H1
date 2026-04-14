@@ -32,6 +32,7 @@ typedef struct
     uint32_t last_csv_tick;
     uint32_t last_dshot_send_tick;
     uint32_t last_zero_offset_sample_tick;
+    uint32_t last_current_filter_tick;
     uint32_t last_oled_update_tick;
     uint32_t last_oled_init_attempt_tick;
     uint32_t button_change_tick;
@@ -43,6 +44,7 @@ typedef struct
     float zero_offset_sum_v;
     float baseline_zero_offset_voltage;
     float active_zero_offset_voltage;
+    float current_filter_sum_A;
     uint8_t boot_banner_sent;
     uint8_t connected_banner_sent;
     uint8_t wait_start_banner_sent;
@@ -55,6 +57,9 @@ typedef struct
     uint8_t button_raw_pressed;
     uint8_t button_stable_pressed;
     uint8_t oled_ready;
+    uint8_t current_filter_index;
+    uint8_t current_filter_count;
+    float current_filter_buffer[E1_CURRENT_FILTER_WINDOW_SAMPLES];
     E1_AdcProcessed_t adc;
 } E1_TestContext_t;
 
@@ -89,7 +94,8 @@ static void E1_UartRx_Start(void);
 static void E1_ProcessReceivedByte(uint8_t byte);
 static uint8_t E1_IsStartCommand(const char *text);
 static void E1_ProcessStartCommand(void);
-static void E1_UpdateCurrentDerived(E1_AdcProcessed_t *adc_data);
+static void E1_ResetCurrentFilter(void);
+static void E1_UpdateCurrentDerived(E1_AdcProcessed_t *adc_data, uint32_t now_ms);
 static void E1_Button_Task(uint32_t now_ms);
 static void E1_HandleThrottleButtonPress(void);
 static void E1_SendThrottleSetLine(void);
@@ -162,7 +168,7 @@ void E1_Test_Task(void)
 
     process_adc_average(&g_h1.adc);
     update_zero_offset(&g_h1.adc, now_ms);
-    E1_UpdateCurrentDerived(&g_h1.adc);
+    E1_UpdateCurrentDerived(&g_h1.adc, now_ms);
     E1_Dshot_Service(now_ms);
     E1_StatusLed_Update(now_ms);
     E1_Button_Task(now_ms);
@@ -321,13 +327,10 @@ void process_adc_average(E1_AdcProcessed_t *out)
     out->v_i_sense = (float)out->adc_i_raw * adc_to_volt;
     out->v_vbat_adc = (float)out->adc_vbat_raw * adc_to_volt;
     out->vbat_V = out->v_vbat_adc * VBAT_DIVIDER_RATIO;
-    E1_UpdateCurrentDerived(out);
 }
 
 void update_zero_offset(const E1_AdcProcessed_t *adc_data, uint32_t now_ms)
 {
-    uint32_t state_elapsed_ms;
-
     if (adc_data == NULL)
     {
         return;
@@ -338,56 +341,45 @@ void update_zero_offset(const E1_AdcProcessed_t *adc_data, uint32_t now_ms)
         return;
     }
 
+    if (g_h1.zero_offset_sample_count >= E1_BASELINE_SAMPLE_COUNT)
+    {
+        return;
+    }
+
     if ((now_ms - g_h1.last_zero_offset_sample_tick) < E1_ZERO_OFFSET_SAMPLE_INTERVAL_MS)
     {
         return;
     }
 
     g_h1.last_zero_offset_sample_tick = now_ms;
+    g_h1.zero_offset_sum_v += adc_data->v_i_sense;
+    g_h1.zero_offset_sample_count++;
 
-    if ((g_h1.state == STATE_WAIT_BT) || (g_h1.state == STATE_PREPARE))
-    {
-        g_h1.zero_offset_sum_v += adc_data->v_i_sense;
-        g_h1.zero_offset_sample_count++;
-
-        if (g_h1.zero_offset_sample_count > 0U)
-        {
-            g_h1.baseline_zero_offset_voltage = g_h1.zero_offset_sum_v / (float)g_h1.zero_offset_sample_count;
-            g_h1.active_zero_offset_voltage = g_h1.baseline_zero_offset_voltage;
-        }
-        return;
-    }
-
-    state_elapsed_ms = now_ms - g_h1.state_enter_tick;
-
-    if (g_h1.state == STATE_STOP)
-    {
-        if (state_elapsed_ms >= E1_ZERO_TRACK_DELAY_MS)
-        {
-            g_h1.active_zero_offset_voltage +=
-                E1_ZERO_TRACK_ALPHA_STOP * (adc_data->v_i_sense - g_h1.active_zero_offset_voltage);
-        }
-        return;
-    }
-
-    if (g_h1.state == STATE_DONE)
-    {
-        g_h1.active_zero_offset_voltage +=
-            E1_ZERO_TRACK_ALPHA_DONE * (adc_data->v_i_sense - g_h1.active_zero_offset_voltage);
-    }
+    g_h1.baseline_zero_offset_voltage = g_h1.zero_offset_sum_v / (float)g_h1.zero_offset_sample_count;
+    g_h1.active_zero_offset_voltage = g_h1.baseline_zero_offset_voltage;
 }
 
-static void E1_UpdateCurrentDerived(E1_AdcProcessed_t *adc_data)
+static void E1_ResetCurrentFilter(void)
+{
+    memset(g_h1.current_filter_buffer, 0, sizeof(g_h1.current_filter_buffer));
+    g_h1.current_filter_sum_A = 0.0f;
+    g_h1.current_filter_index = 0U;
+    g_h1.current_filter_count = 0U;
+    g_h1.last_current_filter_tick = 0U;
+}
+
+static void E1_UpdateCurrentDerived(E1_AdcProcessed_t *adc_data, uint32_t now_ms)
 {
     float signed_delta_v;
+    float instant_current_a;
 
     if (adc_data == NULL)
     {
         return;
     }
 
-    adc_data->active_zero_offset_V = g_h1.active_zero_offset_voltage;
-    adc_data->delta_i_V = adc_data->v_i_sense - g_h1.active_zero_offset_voltage;
+    adc_data->active_zero_offset_V = g_h1.baseline_zero_offset_voltage;
+    adc_data->delta_i_V = adc_data->v_i_sense - g_h1.baseline_zero_offset_voltage;
 
 #if (E1_CURRENT_SIGN_INVERT != 0U)
     signed_delta_v = -adc_data->delta_i_V;
@@ -395,10 +387,44 @@ static void E1_UpdateCurrentDerived(E1_AdcProcessed_t *adc_data)
     signed_delta_v = adc_data->delta_i_V;
 #endif
 
-    adc_data->current_A = signed_delta_v * CURRENT_SCALE_A_PER_V;
-    if (adc_data->current_A < 0.0f)
+    instant_current_a = signed_delta_v * CURRENT_SCALE_A_PER_V;
+    if (instant_current_a < 0.0f)
     {
-        adc_data->current_A = 0.0f;
+        instant_current_a = 0.0f;
+    }
+
+    if ((g_h1.last_current_filter_tick == 0U) ||
+        ((now_ms - g_h1.last_current_filter_tick) >= E1_CURRENT_FILTER_SAMPLE_INTERVAL_MS))
+    {
+        g_h1.last_current_filter_tick = now_ms;
+
+        if (g_h1.current_filter_count < E1_CURRENT_FILTER_WINDOW_SAMPLES)
+        {
+            g_h1.current_filter_buffer[g_h1.current_filter_index] = instant_current_a;
+            g_h1.current_filter_sum_A += instant_current_a;
+            g_h1.current_filter_count++;
+        }
+        else
+        {
+            g_h1.current_filter_sum_A -= g_h1.current_filter_buffer[g_h1.current_filter_index];
+            g_h1.current_filter_buffer[g_h1.current_filter_index] = instant_current_a;
+            g_h1.current_filter_sum_A += instant_current_a;
+        }
+
+        g_h1.current_filter_index++;
+        if (g_h1.current_filter_index >= E1_CURRENT_FILTER_WINDOW_SAMPLES)
+        {
+            g_h1.current_filter_index = 0U;
+        }
+    }
+
+    if (g_h1.current_filter_count > 0U)
+    {
+        adc_data->current_A = g_h1.current_filter_sum_A / (float)g_h1.current_filter_count;
+    }
+    else
+    {
+        adc_data->current_A = instant_current_a;
     }
 
     adc_data->power_W = adc_data->vbat_V * adc_data->current_A;
@@ -476,6 +502,7 @@ static void E1_Test_EnterState(E1_TestState_t new_state)
         break;
 
     case STATE_RUN:
+        E1_ResetCurrentFilter();
         set_throttle_command(g_h1.run_cmd_dshot);
         break;
 
@@ -505,6 +532,7 @@ static void E1_StartSession(uint32_t now_ms)
     g_h1.zero_offset_sample_count = 0U;
     g_h1.baseline_zero_offset_voltage = CURRENT_OFFSET_V;
     g_h1.active_zero_offset_voltage = CURRENT_OFFSET_V;
+    E1_ResetCurrentFilter();
     g_h1.start_command_received = 0U;
     g_h1.start_armed_once = 0U;
     g_h1.header_sent = 0U;
@@ -521,7 +549,7 @@ static uint8_t E1_IsBluetoothConnected(void)
 static void E1_SendBootBannerOnce(void)
 {
     static const char banner[] =
-        "# boot,t_ms=0,fw=E1_DSHOT300_HC05_TRIGGER,uart=9600,protocol=firewater\r\n";
+        "# boot,t_ms=0,fw=E1_DSHOT300_BASELINE_AVG,uart=9600,protocol=firewater\r\n";
 
     if (g_h1.boot_banner_sent == 0U)
     {

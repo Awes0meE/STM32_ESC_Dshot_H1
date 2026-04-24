@@ -60,20 +60,50 @@ extern "C" {
 #define E1_RUN_THROTTLE_STEP_DSHOT     100U
 #endif
 
+#ifndef E1_RAMP_START_DSHOT
+#define E1_RAMP_START_DSHOT            800U
+#endif
+
+#ifndef E1_RAMP_MS
+#define E1_RAMP_MS                     10000U
+#endif
+
 #ifndef E1_RUN_MS
 #define E1_RUN_MS                      60000U
 #endif
 
-#ifndef E1_STOP_MS
-#define E1_STOP_MS                     10000U
+#ifndef E1_TEST_CYCLE_COUNT
+#define E1_TEST_CYCLE_COUNT            3U
+#endif
+
+#ifndef E1_REST_MS
+#define E1_REST_MS                     30000U
 #endif
 
 #ifndef E1_SESSION_MAX_MS
-#define E1_SESSION_MAX_MS              100000U
+#define E1_SESSION_MAX_MS \
+    (E1_BT_PREPARE_MS + (E1_TEST_CYCLE_COUNT * (E1_RAMP_MS + E1_RUN_MS)) + \
+     ((E1_TEST_CYCLE_COUNT - 1U) * E1_REST_MS) + 10000U)
 #endif
 
 #ifndef E1_CSV_INTERVAL_MS
-#define E1_CSV_INTERVAL_MS             500U
+#define E1_CSV_INTERVAL_MS             1000U
+#endif
+
+#ifndef E1_UART_BOOT_QUIET_MS
+#define E1_UART_BOOT_QUIET_MS          2000U
+#endif
+
+#ifndef E1_UART_TX_BUFFER_SIZE
+#define E1_UART_TX_BUFFER_SIZE         1024U
+#endif
+
+#ifndef E1_CURRENT_TRIP_A
+#define E1_CURRENT_TRIP_A              55.0f
+#endif
+
+#ifndef E1_CURRENT_TRIP_HOLD_MS
+#define E1_CURRENT_TRIP_HOLD_MS        100U
 #endif
 
 #ifndef E1_ZERO_OFFSET_SAMPLE_INTERVAL_MS
@@ -105,6 +135,10 @@ extern "C" {
 
 #ifndef E1_OLED_UPDATE_INTERVAL_MS
 #define E1_OLED_UPDATE_INTERVAL_MS     200U
+#endif
+
+#ifndef E1_OLED_I2C_TIMEOUT_MS
+#define E1_OLED_I2C_TIMEOUT_MS         25U
 #endif
 
 #ifndef E1_OLED_POWERUP_DELAY_MS
@@ -162,7 +196,8 @@ typedef enum
     STATE_RUN     = 2,
     STATE_STOP    = 3,
     STATE_DONE    = 4,
-    STATE_IDLE    = 5
+    STATE_IDLE    = 5,
+    STATE_RAMP    = 6
 } E1_TestState_t;
 
 typedef struct

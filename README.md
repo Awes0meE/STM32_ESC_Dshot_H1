@@ -8,7 +8,7 @@
 
 <p>
   <img src="https://img.shields.io/badge/MCU-STM32F103C8T6-03234B" alt="MCU">
-  <img src="https://img.shields.io/badge/Firmware-E1--V2.0--DShot300-2ea44f" alt="Firmware">
+  <img src="https://img.shields.io/badge/Firmware-E1--V3.0--DShot300-2ea44f" alt="Firmware">
   <img src="https://img.shields.io/badge/Protocol-DShot300-orange" alt="Protocol">
   <img src="https://img.shields.io/badge/Platform-Blue%20Pill-1f6feb" alt="Platform">
   <img src="https://img.shields.io/badge/Use%20Case-ESC%20Steady--State%20Comparison-purple" alt="Use Case">
@@ -37,6 +37,7 @@
   - [13. Build](#13-build)
   - [14. Current Scope](#14-current-scope)
   - [15. E1-V2.0-DShot300 Update](#15-e1-v20-dshot300-update)
+  - [16. E1-V3.0-DShot300 Update](#16-e1-v30-dshot300-update)
 - [中文](#中文)
   - [E1 实验固件说明](#e1-实验固件说明)
   - [1. 项目用途](#1-项目用途)
@@ -54,6 +55,7 @@
   - [13. 编译](#13-编译)
   - [14. 当前版本边界](#14-当前版本边界)
   - [15. E1-V2.0-DShot300 版本更新](#15-e1-v20-dshot300-版本更新)
+  - [16. E1-V3.0-DShot300 版本更新](#16-e1-v30-dshot300-版本更新)
 
 ---
 
@@ -101,12 +103,17 @@ The current logic is:
 4. wait for Bluetooth link confirmation from `HC-05 STATE`
 5. after Bluetooth is confirmed, wait for serial command `START`
 6. enter `PREPARE` for 10 s
-7. enter `RUN` for 60 s
-8. enter `STOP` for 10 s
-9. enter `DONE`
-10. after total session time reaches 100 s, enter `IDLE`
+7. ramp cycle 1 from `E1_RAMP_START_DSHOT` to the selected throttle for 10 s
+8. run cycle 1 at the selected fixed throttle for 60 s
+9. rest at DShot stop for 30 s
+10. ramp cycle 2 from `E1_RAMP_START_DSHOT` to the same throttle for 10 s
+11. run cycle 2 at the same throttle for 60 s
+12. rest at DShot stop for 30 s
+13. ramp cycle 3 from `E1_RAMP_START_DSHOT` to the same throttle for 10 s
+14. run cycle 3 at the same throttle for 60 s
+15. enter `DONE`, then `IDLE` after the guard timeout
 
-The MCU performs the timing locally. The PC side only needs to connect and send `START`.
+The MCU performs the timing locally. The PC side only needs to connect, choose the throttle with the button if needed, and send `START`.
 
 ### Workflow Diagram
 
@@ -117,10 +124,16 @@ flowchart TD
     C --> D[Wait for HC-05 STATE confirmation]
     D --> E[Wait for serial command START]
     E --> F[PREPARE 10 s]
-    F --> G[RUN 60 s]
-    G --> H[STOP 10 s]
-    H --> I[DONE]
-    I --> J[IDLE when total session time reaches 100 s]
+    F --> G[RAMP cycle 1, 10 s]
+    G --> H[RUN cycle 1, 60 s]
+    H --> I[REST 30 s]
+    I --> J[RAMP cycle 2, 10 s]
+    J --> K[RUN cycle 2, 60 s]
+    K --> L[REST 30 s]
+    L --> M[RAMP cycle 3, 10 s]
+    M --> N[RUN cycle 3, 60 s]
+    N --> O[DONE]
+    O --> P[IDLE after guard timeout]
 ```
 
 ---
@@ -221,13 +234,13 @@ The OLED shows 5 lines:
 ### Typical line 5 content
 
 - `PREP 09S`
-- `TIME 12S`
-- `TIME 36S`
+- `RUN1 12S`
+- `REST 28S`
 
 ### Additional visual prompt in `RUN`
 
-- blink `R` around `25 ~ 30 s` as reminder for RPM measurement at 30 s
-- blink `H` around `35 ~ 40 s` as reminder for hotspot / thermal measurement at 40 s
+- blink `R` around `25 ~ 30 s` in each run cycle as reminder for RPM measurement at 30 s
+- blink `H` around `35 ~ 40 s` in each run cycle as reminder for hotspot / thermal measurement at 40 s
 
 ---
 
@@ -355,9 +368,17 @@ Defined in [`Core/Inc/app_e1_test.h`](./Core/Inc/app_e1_test.h):
 
 - `E1_BT_PREPARE_MS`
 - `E1_BT_CONNECT_CONFIRM_MS`
+- `E1_RAMP_MS`
 - `E1_RUN_MS`
-- `E1_STOP_MS`
+- `E1_TEST_CYCLE_COUNT`
+- `E1_REST_MS`
 - `E1_SESSION_MAX_MS`
+- `E1_CSV_INTERVAL_MS`
+
+### UART / Bluetooth Robustness
+
+- `E1_UART_BOOT_QUIET_MS`
+- `E1_UART_TX_BUFFER_SIZE`
 
 ### DShot
 
@@ -365,6 +386,7 @@ Defined in [`Core/Inc/app_e1_test.h`](./Core/Inc/app_e1_test.h):
 - `E1_RUN_THROTTLE_MIN_DSHOT`
 - `E1_RUN_THROTTLE_MAX_DSHOT`
 - `E1_RUN_THROTTLE_STEP_DSHOT`
+- `E1_RAMP_START_DSHOT`
 - `E1_DSHOT_SEND_INTERVAL_MS`
 
 ### Analog
@@ -378,9 +400,15 @@ Defined in [`Core/Inc/app_e1_test.h`](./Core/Inc/app_e1_test.h):
 - `E1_ZERO_TRACK_ALPHA_STOP`
 - `E1_ZERO_TRACK_ALPHA_DONE`
 
+### Safety
+
+- `E1_CURRENT_TRIP_A`
+- `E1_CURRENT_TRIP_HOLD_MS`
+
 ### Display
 
 - `E1_OLED_UPDATE_INTERVAL_MS`
+- `E1_OLED_I2C_TIMEOUT_MS`
 - `E1_OLED_I2C_ADDR`
 - `E1_OLED_COLUMN_OFFSET`
 
@@ -435,6 +463,24 @@ This version is intended to be the `E1-V2.0-DShot300` milestone for the current 
 
 ---
 
+## 16. E1-V3.0-DShot300 Update
+
+This release keeps `DShot300` and focuses on safer high-throttle bench testing.
+
+Main changes:
+
+- automatic 3-cycle test flow: each cycle ramps, runs for 60 s, and rests before the next cycle
+- soft throttle ramp: each cycle starts from `E1_RAMP_START_DSHOT = 800` and reaches the selected throttle over `E1_RAMP_MS = 10000`
+- serial output rate reduced to `E1_CSV_INTERVAL_MS = 1000` to reduce VOFA / Bluetooth buffer pressure
+- UART output is non-blocking and old queued data is cleared when a new test starts
+- Bluetooth reset / reconnect behavior is hardened to avoid unsolicited boot spam into VOFA
+- over-current safety latch and forced DShot stop are enabled during both `RAMP` and `RUN`
+- OLED I2C timeout is tuned for the 100 kHz bus while still avoiding long display-related stalls
+
+The `1600` DShot target throttle point has been bench-verified with the ramped startup flow.
+
+---
+
 # 中文
 
 ## E1 实验固件说明
@@ -479,12 +525,14 @@ This version is intended to be the `E1-V2.0-DShot300` milestone for the current 
 4. 等待 `HC-05 STATE` 确认蓝牙已连接
 5. 蓝牙确认后等待串口命令 `START`
 6. 进入 `PREPARE`，持续 10 秒
-7. 进入 `RUN`，持续 60 秒
-8. 进入 `STOP`，持续 10 秒
-9. 进入 `DONE`
-10. 当总 session 时长达到 100 秒后，进入 `IDLE`
+7. 第 1 轮按选定固定油门运行 60 秒
+8. DShot stop 休息 30 秒
+9. 第 2 轮按同一油门运行 60 秒
+10. DShot stop 休息 30 秒
+11. 第 3 轮按同一油门运行 60 秒
+12. 进入 `DONE`，保护超时后进入 `IDLE`
 
-整个时序由 STM32 本地执行，PC 端只需要连上蓝牙并发送 `START`。
+整个时序由 STM32 本地执行，PC 端只需要连上蓝牙、按需用按钮选油门，并发送 `START`。
 
 ### 流程图
 
@@ -495,10 +543,13 @@ flowchart TD
     C --> D[等待 HC-05 STATE 确认蓝牙连接]
     D --> E[等待串口命令 START]
     E --> F[PREPARE 10 s]
-    F --> G[RUN 60 s]
-    G --> H[STOP 10 s]
-    H --> I[DONE]
-    I --> J[当总 session 达到 100 s 后进入 IDLE]
+    F --> G[RUN cycle 1, 60 s]
+    G --> H[REST 30 s]
+    H --> I[RUN cycle 2, 60 s]
+    I --> J[REST 30 s]
+    J --> K[RUN cycle 3, 60 s]
+    K --> L[DONE]
+    L --> M[guard timeout 后进入 IDLE]
 ```
 
 ---
@@ -601,13 +652,13 @@ OLED 当前显示 5 行：
 ### 第 5 行典型显示内容例如
 
 - `PREP 09S`
-- `TIME 12S`
-- `TIME 36S`
+- `RUN1 12S`
+- `REST 28S`
 
 ### 在 `RUN` 状态下还有额外视觉提示
 
-- 在 `25 ~ 30 s` 附近闪烁 `R`，提示 30 秒测速
-- 在 `35 ~ 40 s` 附近闪烁 `H`，提示 40 秒测热点
+- 每轮 `RUN` 的 `25 ~ 30 s` 附近闪烁 `R`，提示 30 秒测速
+- 每轮 `RUN` 的 `35 ~ 40 s` 附近闪烁 `H`，提示 40 秒测热点
 
 ---
 
@@ -729,9 +780,17 @@ power_W   = current_A * vbat_V
 
 - `E1_BT_PREPARE_MS`
 - `E1_BT_CONNECT_CONFIRM_MS`
+- `E1_RAMP_MS`
 - `E1_RUN_MS`
-- `E1_STOP_MS`
+- `E1_TEST_CYCLE_COUNT`
+- `E1_REST_MS`
 - `E1_SESSION_MAX_MS`
+- `E1_CSV_INTERVAL_MS`
+
+### 串口 / 蓝牙稳健性
+
+- `E1_UART_BOOT_QUIET_MS`
+- `E1_UART_TX_BUFFER_SIZE`
 
 ### DShot / 油门
 
@@ -739,6 +798,7 @@ power_W   = current_A * vbat_V
 - `E1_RUN_THROTTLE_MIN_DSHOT`
 - `E1_RUN_THROTTLE_MAX_DSHOT`
 - `E1_RUN_THROTTLE_STEP_DSHOT`
+- `E1_RAMP_START_DSHOT`
 - `E1_DSHOT_SEND_INTERVAL_MS`
 
 ### 模拟量
@@ -752,9 +812,15 @@ power_W   = current_A * vbat_V
 - `E1_ZERO_TRACK_ALPHA_STOP`
 - `E1_ZERO_TRACK_ALPHA_DONE`
 
+### 安全保护
+
+- `E1_CURRENT_TRIP_A`
+- `E1_CURRENT_TRIP_HOLD_MS`
+
 ### 显示
 
 - `E1_OLED_UPDATE_INTERVAL_MS`
+- `E1_OLED_I2C_TIMEOUT_MS`
 - `E1_OLED_I2C_ADDR`
 - `E1_OLED_COLUMN_OFFSET`
 
@@ -806,3 +872,21 @@ cmake --build --preset Debug
 - 电流结果小于 `0` 时会强制钳到 `0`，避免稳态日志中出现负电流和负功率
 
 这一版可作为当前稳态 ESC 对比流程的 `E1-V2.0-DShot300` 里程碑版本。
+
+---
+
+## 16. E1-V3.0-DShot300 版本更新
+
+这一版继续使用 `DShot300`，重点优化高油门台架测试时的安全性和串口稳定性。
+
+主要改动：
+
+- 自动执行 3 轮测试流程：每轮先缓坡、再固定油门运行 60 秒，轮次之间休息
+- 软启动油门缓坡：每轮从 `E1_RAMP_START_DSHOT = 800` 开始，在 `E1_RAMP_MS = 10000` 内推到选定油门
+- 串口 CSV 输出间隔调整为 `E1_CSV_INTERVAL_MS = 1000`，降低 VOFA / 蓝牙缓存压力
+- UART 输出改为非阻塞，新测试开始时会清掉旧的发送队列
+- 加固蓝牙复位 / 重连行为，避免 MCU reset 后主动刷屏导致 VOFA 卡死
+- `RAMP` 和 `RUN` 阶段都启用过流锁存保护和强制 DShot stop
+- OLED I2C 超时按 100 kHz 总线重新调整，兼顾正常刷新和异常时不长时间卡主循环
+
+`1600` DShot 目标油门已经使用缓坡启动流程完成台架验证。

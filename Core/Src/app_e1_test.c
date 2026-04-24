@@ -19,7 +19,6 @@
 #define E1_DSHOT_BIT_0_HIGH_TICKS         90U
 #define E1_DSHOT_BIT_1_HIGH_TICKS         180U
 
-#define E1_UART_TX_TIMEOUT_MS             500U
 #define E1_STATUS_LED_ON_LEVEL            GPIO_PIN_RESET
 #define E1_STATUS_LED_OFF_LEVEL           GPIO_PIN_SET
 #define E1_BT_CONNECTED_LEVEL             GPIO_PIN_SET
@@ -37,9 +36,11 @@ typedef struct
     uint32_t last_oled_init_attempt_tick;
     uint32_t button_change_tick;
     uint32_t bt_high_since_tick;
+    uint32_t current_trip_start_tick;
     uint16_t current_cmd_us;
     uint16_t current_dshot_value;
     uint16_t run_cmd_dshot;
+    uint8_t current_cycle;
     uint32_t zero_offset_sample_count;
     float zero_offset_sum_v;
     float baseline_zero_offset_voltage;
@@ -52,10 +53,13 @@ typedef struct
     uint8_t dshot_dma_busy;
     uint8_t bt_state_last;
     uint8_t bt_confirmed;
+    uint8_t bt_unsolicited_allowed;
     uint8_t start_command_received;
+    uint8_t start_ack_pending;
     uint8_t start_armed_once;
     uint8_t button_raw_pressed;
     uint8_t button_stable_pressed;
+    uint8_t safety_fault_latched;
     uint8_t oled_ready;
     uint8_t current_filter_index;
     uint8_t current_filter_count;
@@ -70,6 +74,12 @@ static uint8_t g_oled_buffer[128U * 8U];
 static uint8_t g_uart_rx_byte;
 static char g_uart_cmd_buffer[16];
 static uint8_t g_uart_cmd_index;
+static uint8_t g_uart_tx_buffer[E1_UART_TX_BUFFER_SIZE];
+static volatile uint16_t g_uart_tx_head;
+static volatile uint16_t g_uart_tx_tail;
+static volatile uint8_t g_uart_tx_busy;
+static volatile uint8_t g_uart_rx_active;
+static uint8_t g_uart_tx_byte;
 
 static void E1_Test_EnterState(E1_TestState_t new_state);
 static void E1_StartSession(uint32_t now_ms);
@@ -80,7 +90,10 @@ static void E1_SendWaitStartBannerOnce(void);
 static void E1_SendStartAck(void);
 static void E1_SendCsvHeaderOnce(void);
 static void E1_SendStateChangeLine(E1_TestState_t state);
-static void E1_UartWrite(const char *text);
+static uint8_t E1_UartWrite(const char *text);
+static uint8_t E1_UartCanSend(void);
+static void E1_UartTx_StartNext(void);
+static void E1_UartTx_ResetQueue(void);
 static void E1_FormatFloat3(char *dst, size_t len, float value);
 static void E1_StatusLed_Set(uint8_t on);
 static void E1_StatusLed_Update(uint32_t now_ms);
@@ -96,6 +109,11 @@ static uint8_t E1_IsStartCommand(const char *text);
 static void E1_ProcessStartCommand(void);
 static void E1_ResetCurrentFilter(void);
 static void E1_UpdateCurrentDerived(E1_AdcProcessed_t *adc_data, uint32_t now_ms);
+static uint16_t E1_GetRampStartDshot(void);
+static void E1_UpdateRampThrottle(uint32_t now_ms);
+static void E1_Safety_Task(uint32_t now_ms);
+static void E1_TriggerSafetyFault(const char *reason);
+static void E1_ForceMotorStopFrame(void);
 static void E1_Button_Task(uint32_t now_ms);
 static void E1_HandleThrottleButtonPress(void);
 static void E1_SendThrottleSetLine(void);
@@ -123,6 +141,8 @@ void E1_Test_Init(void)
     g_h1.run_cmd_dshot = E1_RUN_THROTTLE_DSHOT;
     g_h1.baseline_zero_offset_voltage = CURRENT_OFFSET_V;
     g_h1.active_zero_offset_voltage = CURRENT_OFFSET_V;
+    g_h1.bt_state_last = E1_IsBluetoothConnected();
+    g_h1.bt_unsolicited_allowed = (g_h1.bt_state_last == 0U) ? 1U : 0U;
 
     if (g_h1.run_cmd_dshot < E1_RUN_THROTTLE_MIN_DSHOT)
     {
@@ -169,6 +189,9 @@ void E1_Test_Task(void)
     process_adc_average(&g_h1.adc);
     update_zero_offset(&g_h1.adc, now_ms);
     E1_UpdateCurrentDerived(&g_h1.adc, now_ms);
+    E1_Safety_Task(now_ms);
+    E1_UartRx_Start();
+    E1_UpdateRampThrottle(now_ms);
     E1_Dshot_Service(now_ms);
     E1_StatusLed_Update(now_ms);
     E1_Button_Task(now_ms);
@@ -176,6 +199,17 @@ void E1_Test_Task(void)
     E1_Oled_Update(now_ms);
 
     bt_connected = E1_IsBluetoothConnected();
+    if ((bt_connected == 0U) &&
+        ((g_h1.state == STATE_PREPARE) || (g_h1.state == STATE_RAMP) ||
+         (g_h1.state == STATE_RUN) || (g_h1.state == STATE_STOP)))
+    {
+        E1_ForceMotorStopFrame();
+        g_h1.state = STATE_WAIT_BT;
+        g_h1.state_enter_tick = now_ms;
+        g_h1.test_start_tick = now_ms;
+        g_h1.safety_fault_latched = 1U;
+    }
+
     if (g_h1.state == STATE_WAIT_BT)
     {
         if (bt_connected != 0U)
@@ -188,9 +222,17 @@ void E1_Test_Task(void)
             if ((now_ms - g_h1.bt_high_since_tick) >= E1_BT_CONNECT_CONFIRM_MS)
             {
                 g_h1.bt_confirmed = 1U;
-                E1_SendBootBannerOnce();
-                E1_SendConnectedBannerOnce();
-                E1_SendWaitStartBannerOnce();
+                if (g_h1.bt_unsolicited_allowed != 0U)
+                {
+                    E1_SendBootBannerOnce();
+                    E1_SendConnectedBannerOnce();
+                    E1_SendWaitStartBannerOnce();
+                }
+            }
+
+            if (g_h1.start_ack_pending != 0U)
+            {
+                E1_SendStartAck();
             }
 
             if ((g_h1.bt_confirmed != 0U) && (g_h1.start_command_received != 0U))
@@ -204,18 +246,32 @@ void E1_Test_Task(void)
             g_h1.bt_high_since_tick = 0U;
             g_h1.bt_confirmed = 0U;
             g_h1.start_command_received = 0U;
+            g_h1.start_ack_pending = 0U;
             g_h1.start_armed_once = 0U;
             g_h1.boot_banner_sent = 0U;
             g_h1.connected_banner_sent = 0U;
             g_h1.wait_start_banner_sent = 0U;
+            g_h1.current_cycle = 0U;
+            g_h1.bt_unsolicited_allowed = 1U;
+            E1_UartTx_ResetQueue();
         }
     }
     g_h1.bt_state_last = bt_connected;
+
+    if ((bt_connected != 0U) && (g_h1.start_ack_pending != 0U))
+    {
+        E1_SendStartAck();
+    }
 
     if ((g_h1.state != STATE_WAIT_BT) && ((now_ms - g_h1.test_start_tick) >= E1_SESSION_MAX_MS))
     {
         E1_Test_EnterState(STATE_IDLE);
         return;
+    }
+
+    if ((g_h1.state != STATE_WAIT_BT) && (g_h1.header_sent == 0U))
+    {
+        E1_SendCsvHeaderOnce();
     }
 
     if ((g_h1.state != STATE_WAIT_BT) && ((now_ms - g_h1.last_csv_tick) >= E1_CSV_INTERVAL_MS))
@@ -234,6 +290,13 @@ void E1_Test_Task(void)
     case STATE_PREPARE:
         if (state_elapsed_ms >= E1_BT_PREPARE_MS)
         {
+            E1_Test_EnterState(STATE_RAMP);
+        }
+        break;
+
+    case STATE_RAMP:
+        if (state_elapsed_ms >= E1_RAMP_MS)
+        {
             E1_Test_EnterState(STATE_RUN);
         }
         break;
@@ -241,14 +304,22 @@ void E1_Test_Task(void)
     case STATE_RUN:
         if (state_elapsed_ms >= E1_RUN_MS)
         {
-            E1_Test_EnterState(STATE_STOP);
+            if (g_h1.current_cycle < E1_TEST_CYCLE_COUNT)
+            {
+                E1_Test_EnterState(STATE_STOP);
+            }
+            else
+            {
+                E1_Test_EnterState(STATE_DONE);
+            }
         }
         break;
 
     case STATE_STOP:
-        if (state_elapsed_ms >= E1_STOP_MS)
+        if (state_elapsed_ms >= E1_REST_MS)
         {
-            E1_Test_EnterState(STATE_DONE);
+            g_h1.current_cycle++;
+            E1_Test_EnterState(STATE_RAMP);
         }
         break;
 
@@ -267,6 +338,8 @@ const char *E1_Test_GetStateName(E1_TestState_t state)
         return "WAIT_BT";
     case STATE_PREPARE:
         return "PREPARE";
+    case STATE_RAMP:
+        return "RAMP";
     case STATE_RUN:
         return "RUN";
     case STATE_STOP:
@@ -301,6 +374,45 @@ void set_throttle_command(uint16_t cmd)
 {
     g_h1.current_dshot_value = E1_ClampDshotThrottle(cmd);
     g_h1.current_cmd_us = g_h1.current_dshot_value;
+}
+
+static void E1_UpdateRampThrottle(uint32_t now_ms)
+{
+    uint32_t elapsed_ms;
+    uint32_t delta;
+    uint32_t ramped_cmd;
+    uint16_t ramp_start;
+
+    if (g_h1.state != STATE_RAMP)
+    {
+        return;
+    }
+
+    ramp_start = E1_GetRampStartDshot();
+    if (g_h1.run_cmd_dshot <= ramp_start)
+    {
+        set_throttle_command(g_h1.run_cmd_dshot);
+        return;
+    }
+
+    elapsed_ms = now_ms - g_h1.state_enter_tick;
+    if (elapsed_ms >= E1_RAMP_MS)
+    {
+        set_throttle_command(g_h1.run_cmd_dshot);
+        return;
+    }
+
+    delta = (uint32_t)g_h1.run_cmd_dshot - (uint32_t)ramp_start;
+    ramped_cmd = (uint32_t)ramp_start + ((delta * elapsed_ms) / E1_RAMP_MS);
+    set_throttle_command((uint16_t)ramped_cmd);
+}
+
+static uint16_t E1_GetRampStartDshot(void)
+{
+    uint16_t ramp_start;
+
+    ramp_start = E1_ClampDshotThrottle(E1_RAMP_START_DSHOT);
+    return (g_h1.run_cmd_dshot < ramp_start) ? g_h1.run_cmd_dshot : ramp_start;
 }
 
 void process_adc_average(E1_AdcProcessed_t *out)
@@ -430,6 +542,76 @@ static void E1_UpdateCurrentDerived(E1_AdcProcessed_t *adc_data, uint32_t now_ms
     adc_data->power_W = adc_data->vbat_V * adc_data->current_A;
 }
 
+static void E1_Safety_Task(uint32_t now_ms)
+{
+    if (g_h1.safety_fault_latched != 0U)
+    {
+        return;
+    }
+
+    if ((g_h1.state != STATE_RAMP) && (g_h1.state != STATE_RUN))
+    {
+        g_h1.current_trip_start_tick = 0U;
+        return;
+    }
+
+    if (E1_CURRENT_TRIP_A <= 0.0f)
+    {
+        return;
+    }
+
+    if (g_h1.adc.current_A >= E1_CURRENT_TRIP_A)
+    {
+        if (g_h1.current_trip_start_tick == 0U)
+        {
+            g_h1.current_trip_start_tick = now_ms;
+        }
+        else if ((now_ms - g_h1.current_trip_start_tick) >= E1_CURRENT_TRIP_HOLD_MS)
+        {
+            E1_TriggerSafetyFault("overcurrent");
+        }
+    }
+    else
+    {
+        g_h1.current_trip_start_tick = 0U;
+    }
+}
+
+static void E1_TriggerSafetyFault(const char *reason)
+{
+    char line[128];
+    char current_str[20];
+    uint32_t t_ms;
+    int len;
+
+    if (g_h1.safety_fault_latched != 0U)
+    {
+        return;
+    }
+
+    g_h1.safety_fault_latched = 1U;
+    g_h1.state = STATE_DONE;
+    g_h1.state_enter_tick = HAL_GetTick();
+    E1_ForceMotorStopFrame();
+
+    E1_FormatFloat3(current_str, sizeof(current_str), g_h1.adc.current_A);
+    t_ms = g_h1.state_enter_tick - g_h1.test_start_tick;
+    len = snprintf(line,
+                   sizeof(line),
+                   "# safety_fault,t_ms=%lu,reason=%s,current_A=%s,cycle=%u,action=stop\r\n",
+                   (unsigned long)t_ms,
+                   (reason != NULL) ? reason : "unknown",
+                   current_str,
+                   (unsigned int)g_h1.current_cycle);
+    if (len > 0)
+    {
+        (void)E1_UartWrite(line);
+    }
+
+    E1_SendStateChangeLine(STATE_DONE);
+    E1_StatusLed_Update(g_h1.state_enter_tick);
+}
+
 void send_e1_csv_line(const E1_AdcProcessed_t *adc_data)
 {
     char line[288];
@@ -482,7 +664,7 @@ void send_e1_csv_line(const E1_AdcProcessed_t *adc_data)
 
     if (len > 0)
     {
-        HAL_UART_Transmit(&huart1, (uint8_t *)line, (uint16_t)len, E1_UART_TX_TIMEOUT_MS);
+        (void)E1_UartWrite(line);
     }
 }
 
@@ -498,7 +680,16 @@ static void E1_Test_EnterState(E1_TestState_t new_state)
     case STATE_STOP:
     case STATE_DONE:
     case STATE_IDLE:
+        if ((new_state == STATE_IDLE) || (new_state == STATE_WAIT_BT))
+        {
+            g_h1.current_cycle = 0U;
+        }
         set_throttle_command(0U);
+        break;
+
+    case STATE_RAMP:
+        E1_ResetCurrentFilter();
+        set_throttle_command(E1_GetRampStartDshot());
         break;
 
     case STATE_RUN:
@@ -513,10 +704,7 @@ static void E1_Test_EnterState(E1_TestState_t new_state)
 
     if (new_state == STATE_IDLE)
     {
-        if (g_h1.dshot_dma_busy == 0U)
-        {
-            E1_Dshot_TriggerFrame(g_h1.current_dshot_value);
-        }
+        E1_ForceMotorStopFrame();
     }
 
     E1_SendStateChangeLine(new_state);
@@ -525,6 +713,8 @@ static void E1_Test_EnterState(E1_TestState_t new_state)
 
 static void E1_StartSession(uint32_t now_ms)
 {
+    E1_UartTx_ResetQueue();
+
     g_h1.test_start_tick = now_ms;
     g_h1.last_csv_tick = now_ms;
     g_h1.last_zero_offset_sample_tick = now_ms;
@@ -534,8 +724,13 @@ static void E1_StartSession(uint32_t now_ms)
     g_h1.active_zero_offset_voltage = CURRENT_OFFSET_V;
     E1_ResetCurrentFilter();
     g_h1.start_command_received = 0U;
+    g_h1.start_ack_pending = 1U;
+    E1_SendStartAck();
     g_h1.start_armed_once = 0U;
     g_h1.header_sent = 0U;
+    g_h1.current_cycle = 1U;
+    g_h1.safety_fault_latched = 0U;
+    g_h1.current_trip_start_tick = 0U;
 
     E1_Test_EnterState(STATE_PREPARE);
     E1_SendCsvHeaderOnce();
@@ -553,14 +748,16 @@ static void E1_SendBootBannerOnce(void)
 
     if (g_h1.boot_banner_sent == 0U)
     {
-        E1_UartWrite(banner);
-        g_h1.boot_banner_sent = 1U;
+        if (E1_UartWrite(banner) != 0U)
+        {
+            g_h1.boot_banner_sent = 1U;
+        }
     }
 }
 
 static void E1_SendConnectedBannerOnce(void)
 {
-    char line[128];
+    char line[256];
     int len;
 
     if (g_h1.connected_banner_sent != 0U)
@@ -570,14 +767,22 @@ static void E1_SendConnectedBannerOnce(void)
 
     len = snprintf(line,
                    sizeof(line),
-                   "# connected,t_ms=0,state=%s,prepare_ms=%lu,confirm_ms=%lu,run_cmd_raw=%u,dshot_start=after_prepare\r\n",
+                   "# connected,t_ms=0,state=%s,prepare_ms=%lu,confirm_ms=%lu,cycles=%u,ramp_start=%u,ramp_ms=%lu,run_ms=%lu,rest_ms=%lu,run_cmd_raw=%u,dshot_start=after_prepare\r\n",
                    E1_Test_GetStateName(g_h1.state),
                    (unsigned long)E1_BT_PREPARE_MS,
                    (unsigned long)E1_BT_CONNECT_CONFIRM_MS,
-                   (unsigned int)E1_RUN_THROTTLE_DSHOT);
+                   (unsigned int)E1_TEST_CYCLE_COUNT,
+                   (unsigned int)E1_RAMP_START_DSHOT,
+                   (unsigned long)E1_RAMP_MS,
+                   (unsigned long)E1_RUN_MS,
+                   (unsigned long)E1_REST_MS,
+                   (unsigned int)g_h1.run_cmd_dshot);
     if (len > 0)
     {
-        E1_UartWrite(line);
+        if (E1_UartWrite(line) == 0U)
+        {
+            return;
+        }
     }
 
     g_h1.connected_banner_sent = 1U;
@@ -586,21 +791,26 @@ static void E1_SendConnectedBannerOnce(void)
 static void E1_SendWaitStartBannerOnce(void)
 {
     static const char line[] =
-        "# waiting,start_cmd=START,send_newline=optional,action=prepare_after_start\r\n";
+        "# waiting,start_cmd=START,send_newline=optional,action=prepare_then_auto_cycles\r\n";
 
     if (g_h1.wait_start_banner_sent == 0U)
     {
-        E1_UartWrite(line);
-        g_h1.wait_start_banner_sent = 1U;
+        if (E1_UartWrite(line) != 0U)
+        {
+            g_h1.wait_start_banner_sent = 1U;
+        }
     }
 }
 
 static void E1_SendStartAck(void)
 {
     static const char line[] =
-        "# ack,start_received,action=enter_prepare\r\n";
+        "# ack,start_received,action=enter_prepare_then_auto_cycles\r\n";
 
-    E1_UartWrite(line);
+    if (E1_UartWrite(line) != 0U)
+    {
+        g_h1.start_ack_pending = 0U;
+    }
 }
 
 static void E1_SendCsvHeaderOnce(void)
@@ -610,14 +820,16 @@ static void E1_SendCsvHeaderOnce(void)
 
     if (g_h1.header_sent == 0U)
     {
-        E1_UartWrite(header);
-        g_h1.header_sent = 1U;
+        if (E1_UartWrite(header) != 0U)
+        {
+            g_h1.header_sent = 1U;
+        }
     }
 }
 
 static void E1_SendStateChangeLine(E1_TestState_t state)
 {
-    char line[96];
+    char line[160];
     uint32_t t_ms;
     int len;
 
@@ -629,29 +841,131 @@ static void E1_SendStateChangeLine(E1_TestState_t state)
     t_ms = HAL_GetTick() - g_h1.test_start_tick;
     len = snprintf(line,
                    sizeof(line),
-                   "# state_change,t_ms=%lu,state=%u,name=%s\r\n",
+                   "# state_change,t_ms=%lu,state=%u,name=%s,cycle=%u,total_cycles=%u\r\n",
                    (unsigned long)t_ms,
                    (unsigned int)state,
-                   E1_Test_GetStateName(state));
+                   E1_Test_GetStateName(state),
+                   (unsigned int)g_h1.current_cycle,
+                   (unsigned int)E1_TEST_CYCLE_COUNT);
     if (len > 0)
     {
         E1_UartWrite(line);
     }
 }
 
-static void E1_UartWrite(const char *text)
+static uint8_t E1_UartWrite(const char *text)
 {
+    uint16_t free_space;
+    uint32_t primask;
     size_t len;
+    size_t i;
 
     if (text == NULL)
+    {
+        return 0U;
+    }
+
+    if (E1_UartCanSend() == 0U)
+    {
+        return 0U;
+    }
+
+    len = strlen(text);
+    if ((len == 0U) || (len >= E1_UART_TX_BUFFER_SIZE))
+    {
+        return 0U;
+    }
+
+    primask = __get_PRIMASK();
+    __disable_irq();
+    if (g_uart_tx_head >= g_uart_tx_tail)
+    {
+        free_space = (uint16_t)(E1_UART_TX_BUFFER_SIZE - (g_uart_tx_head - g_uart_tx_tail) - 1U);
+    }
+    else
+    {
+        free_space = (uint16_t)(g_uart_tx_tail - g_uart_tx_head - 1U);
+    }
+
+    if (len > free_space)
+    {
+        if (primask == 0U)
+        {
+            __enable_irq();
+        }
+        return 0U;
+    }
+
+    for (i = 0U; i < len; i++)
+    {
+        g_uart_tx_buffer[g_uart_tx_head] = (uint8_t)text[i];
+        g_uart_tx_head = (uint16_t)((g_uart_tx_head + 1U) % E1_UART_TX_BUFFER_SIZE);
+    }
+    if (primask == 0U)
+    {
+        __enable_irq();
+    }
+
+    E1_UartTx_StartNext();
+    return 1U;
+}
+
+static uint8_t E1_UartCanSend(void)
+{
+    if (HAL_GetTick() < E1_UART_BOOT_QUIET_MS)
+    {
+        return 0U;
+    }
+
+    return E1_IsBluetoothConnected();
+}
+
+static void E1_UartTx_StartNext(void)
+{
+    uint32_t primask;
+
+    if (g_uart_tx_busy != 0U)
     {
         return;
     }
 
-    len = strlen(text);
-    if (len > 0U)
+    primask = __get_PRIMASK();
+    __disable_irq();
+    if (g_uart_tx_head == g_uart_tx_tail)
     {
-        HAL_UART_Transmit(&huart1, (uint8_t *)text, (uint16_t)len, E1_UART_TX_TIMEOUT_MS);
+        if (primask == 0U)
+        {
+            __enable_irq();
+        }
+        return;
+    }
+
+    g_uart_tx_byte = g_uart_tx_buffer[g_uart_tx_tail];
+    g_uart_tx_tail = (uint16_t)((g_uart_tx_tail + 1U) % E1_UART_TX_BUFFER_SIZE);
+    g_uart_tx_busy = 1U;
+    if (primask == 0U)
+    {
+        __enable_irq();
+    }
+
+    if (HAL_UART_Transmit_IT(&huart1, &g_uart_tx_byte, 1U) != HAL_OK)
+    {
+        g_uart_tx_busy = 0U;
+    }
+}
+
+static void E1_UartTx_ResetQueue(void)
+{
+    uint32_t primask;
+
+    primask = __get_PRIMASK();
+    __disable_irq();
+    g_uart_tx_head = 0U;
+    g_uart_tx_tail = 0U;
+    g_uart_tx_busy = 0U;
+    if (primask == 0U)
+    {
+        __enable_irq();
     }
 }
 
@@ -758,7 +1072,7 @@ static HAL_StatusTypeDef E1_Oled_WriteCommand(uint8_t command)
 
     frame[0] = 0x00U;
     frame[1] = command;
-    return HAL_I2C_Master_Transmit(&hi2c1, E1_OLED_I2C_ADDR, frame, 2U, 50U);
+    return HAL_I2C_Master_Transmit(&hi2c1, E1_OLED_I2C_ADDR, frame, 2U, E1_OLED_I2C_TIMEOUT_MS);
 }
 
 static HAL_StatusTypeDef E1_Oled_WriteData(const uint8_t *data, uint16_t size)
@@ -772,7 +1086,7 @@ static HAL_StatusTypeDef E1_Oled_WriteData(const uint8_t *data, uint16_t size)
 
     frame[0] = 0x40U;
     memcpy(&frame[1], data, size);
-    return HAL_I2C_Master_Transmit(&hi2c1, E1_OLED_I2C_ADDR, frame, (uint16_t)(size + 1U), 50U);
+    return HAL_I2C_Master_Transmit(&hi2c1, E1_OLED_I2C_ADDR, frame, (uint16_t)(size + 1U), E1_OLED_I2C_TIMEOUT_MS);
 }
 
 static void E1_Oled_Init(void)
@@ -858,10 +1172,15 @@ static void E1_Oled_Flush(void)
 
     for (page = 0U; page < 8U; page++)
     {
-        (void)E1_Oled_WriteCommand((uint8_t)(0xB0U | page));
-        (void)E1_Oled_WriteCommand((uint8_t)(0x00U | (E1_OLED_COLUMN_OFFSET & 0x0FU)));
-        (void)E1_Oled_WriteCommand((uint8_t)(0x10U | ((E1_OLED_COLUMN_OFFSET >> 4U) & 0x0FU)));
-        (void)E1_Oled_WriteData(&g_oled_buffer[page * 128U], 128U);
+        if ((E1_Oled_WriteCommand((uint8_t)(0xB0U | page)) != HAL_OK) ||
+            (E1_Oled_WriteCommand((uint8_t)(0x00U | (E1_OLED_COLUMN_OFFSET & 0x0FU))) != HAL_OK) ||
+            (E1_Oled_WriteCommand((uint8_t)(0x10U | ((E1_OLED_COLUMN_OFFSET >> 4U) & 0x0FU))) != HAL_OK) ||
+            (E1_Oled_WriteData(&g_oled_buffer[page * 128U], 128U) != HAL_OK))
+        {
+            g_h1.oled_ready = 0U;
+            g_h1.last_oled_init_attempt_tick = HAL_GetTick();
+            return;
+        }
     }
 }
 
@@ -877,6 +1196,11 @@ static void E1_Oled_Update(uint32_t now_ms)
     uint32_t prepare_remaining_s;
     uint32_t run_elapsed_ms;
     uint32_t run_elapsed_s;
+    uint32_t ramp_elapsed_ms;
+    uint32_t ramp_remaining_s;
+    uint32_t rest_elapsed_ms;
+    uint32_t rest_remaining_s;
+    uint8_t display_cycle;
     char prompt_char = '\0';
 
     if (g_h1.oled_ready == 0U)
@@ -919,6 +1243,24 @@ static void E1_Oled_Update(uint32_t now_ms)
         prepare_remaining_s = 0U;
     }
 
+    if (g_h1.state == STATE_RAMP)
+    {
+        ramp_elapsed_ms = now_ms - g_h1.state_enter_tick;
+        if (ramp_elapsed_ms >= E1_RAMP_MS)
+        {
+            ramp_remaining_s = 0U;
+        }
+        else
+        {
+            ramp_remaining_s = (E1_RAMP_MS - ramp_elapsed_ms + 999U) / 1000U;
+        }
+    }
+    else
+    {
+        ramp_elapsed_ms = 0U;
+        ramp_remaining_s = 0U;
+    }
+
     if (g_h1.state == STATE_RUN)
     {
         run_elapsed_ms = now_ms - g_h1.state_enter_tick;
@@ -933,14 +1275,42 @@ static void E1_Oled_Update(uint32_t now_ms)
     }
 
     run_elapsed_s = run_elapsed_ms / 1000U;
-    (void)snprintf(line3, sizeof(line3), "THR  %u", (unsigned int)g_h1.run_cmd_dshot);
+    display_cycle = (g_h1.current_cycle == 0U) ? 1U : g_h1.current_cycle;
+    (void)snprintf(line3,
+                   sizeof(line3),
+                   "THR %u C%u-%u",
+                   (unsigned int)g_h1.run_cmd_dshot,
+                   (unsigned int)display_cycle,
+                   (unsigned int)E1_TEST_CYCLE_COUNT);
     if (g_h1.state == STATE_PREPARE)
     {
         (void)snprintf(line4, sizeof(line4), "PREP %2luS", (unsigned long)prepare_remaining_s);
     }
+    else if (g_h1.state == STATE_RAMP)
+    {
+        (void)snprintf(line4, sizeof(line4), "RAMP %2luS", (unsigned long)ramp_remaining_s);
+    }
+    else if (g_h1.state == STATE_STOP)
+    {
+        rest_elapsed_ms = now_ms - g_h1.state_enter_tick;
+        if (rest_elapsed_ms >= E1_REST_MS)
+        {
+            rest_remaining_s = 0U;
+        }
+        else
+        {
+            rest_remaining_s = (E1_REST_MS - rest_elapsed_ms + 999U) / 1000U;
+        }
+
+        (void)snprintf(line4, sizeof(line4), "REST %2luS", (unsigned long)rest_remaining_s);
+    }
+    else if (g_h1.state == STATE_RUN)
+    {
+        (void)snprintf(line4, sizeof(line4), "RUN%u %2luS", (unsigned int)display_cycle, (unsigned long)run_elapsed_s);
+    }
     else
     {
-        (void)snprintf(line4, sizeof(line4), "TIME %2luS", (unsigned long)run_elapsed_s);
+        (void)snprintf(line4, sizeof(line4), "DONE");
     }
 
     if ((g_h1.state == STATE_RUN) && (((now_ms / 300U) % 2U) == 0U))
@@ -1057,6 +1427,7 @@ static void E1_Oled_GetGlyph5x7(char c, uint8_t glyph[5])
     case 'A': glyph[0] = 0x7EU; glyph[1] = 0x11U; glyph[2] = 0x11U; glyph[3] = 0x11U; glyph[4] = 0x7EU; break;
     case 'B': glyph[0] = 0x7FU; glyph[1] = 0x49U; glyph[2] = 0x49U; glyph[3] = 0x49U; glyph[4] = 0x36U; break;
     case 'C': glyph[0] = 0x3EU; glyph[1] = 0x41U; glyph[2] = 0x41U; glyph[3] = 0x41U; glyph[4] = 0x22U; break;
+    case 'D': glyph[0] = 0x7FU; glyph[1] = 0x41U; glyph[2] = 0x41U; glyph[3] = 0x22U; glyph[4] = 0x1CU; break;
     case 'E': glyph[0] = 0x7FU; glyph[1] = 0x49U; glyph[2] = 0x49U; glyph[3] = 0x49U; glyph[4] = 0x41U; break;
     case 'H': glyph[0] = 0x7FU; glyph[1] = 0x08U; glyph[2] = 0x08U; glyph[3] = 0x08U; glyph[4] = 0x7FU; break;
     case 'I': glyph[0] = 0x00U; glyph[1] = 0x41U; glyph[2] = 0x7FU; glyph[3] = 0x41U; glyph[4] = 0x00U; break;
@@ -1094,6 +1465,11 @@ static void E1_StatusLed_Update(uint32_t now_ms)
     case STATE_PREPARE:
         phase_ms = now_ms % 1000U;
         E1_StatusLed_Set((phase_ms < 120U) ? 1U : 0U);
+        break;
+
+    case STATE_RAMP:
+        phase_ms = now_ms % 500U;
+        E1_StatusLed_Set((phase_ms < 250U) ? 1U : 0U);
         break;
 
     case STATE_RUN:
@@ -1232,8 +1608,27 @@ static void E1_Dshot_TriggerFrame(uint16_t throttle_value)
     if (status != HAL_OK)
     {
         g_h1.dshot_dma_busy = 0U;
-        Error_Handler();
+        set_throttle_command(0U);
+        g_h1.safety_fault_latched = 1U;
+        g_h1.state = STATE_DONE;
+        return;
     }
+}
+
+static void E1_ForceMotorStopFrame(void)
+{
+    set_throttle_command(0U);
+
+    if (g_h1.dshot_dma_busy != 0U)
+    {
+        (void)HAL_TIM_PWM_Stop_DMA(&htim4, TIM_CHANNEL_3);
+        g_h1.dshot_dma_busy = 0U;
+    }
+
+    __HAL_TIM_DISABLE(&htim4);
+    __HAL_TIM_SET_COUNTER(&htim4, 0U);
+    __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_3, 0U);
+    E1_Dshot_TriggerFrame(0U);
 }
 
 static void E1_Dshot_Service(uint32_t now_ms)
@@ -1256,16 +1651,47 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
     if (huart->Instance == USART1)
     {
+        g_uart_rx_active = 0U;
         E1_ProcessReceivedByte(g_uart_rx_byte);
+        E1_UartRx_Start();
+    }
+}
+
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART1)
+    {
+        g_uart_tx_busy = 0U;
+        E1_UartTx_StartNext();
+    }
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART1)
+    {
+        g_uart_rx_active = 0U;
+        g_uart_tx_busy = 0U;
+        E1_UartTx_ResetQueue();
         E1_UartRx_Start();
     }
 }
 
 static void E1_UartRx_Start(void)
 {
-    if (HAL_UART_Receive_IT(&huart1, &g_uart_rx_byte, 1U) != HAL_OK)
+    if (g_uart_rx_active != 0U)
     {
-        Error_Handler();
+        return;
+    }
+
+    if (HAL_UART_Receive_IT(&huart1, &g_uart_rx_byte, 1U) == HAL_OK)
+    {
+        g_uart_rx_active = 1U;
+    }
+    else
+    {
+        __HAL_UART_CLEAR_OREFLAG(&huart1);
+        g_uart_rx_active = 0U;
     }
 }
 
@@ -1335,7 +1761,7 @@ static void E1_ProcessStartCommand(void)
     if (g_h1.start_armed_once == 0U)
     {
         g_h1.start_command_received = 1U;
+        g_h1.start_ack_pending = 1U;
         g_h1.start_armed_once = 1U;
-        E1_SendStartAck();
     }
 }
